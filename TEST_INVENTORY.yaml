@@ -43,6 +43,60 @@ test_inventory:
       test_function: test_fr01_example_unit
       test_file: tests/unit/test_fr01.py
       cross_ref_nfrs: [NFR-02]
+    - tc_id: TC-FR02-01
+      fr: FR-02
+      ac: AC-2.1
+      layer: integration
+      test_function: test_fr02_run_task_returns_202_with_run_id
+      test_file: tests/integration/test_fr02.py
+    - tc_id: TC-FR03-01
+      fr: FR-03
+      ac: AC-3.1
+      layer: integration
+      test_function: test_fr03_missing_api_key_returns_401
+      test_file: tests/integration/test_fr03.py
+    - tc_id: TC-FR04-01
+      fr: FR-04
+      ac: AC-4.2
+      layer: integration
+      test_function: test_fr04_insufficient_scope_returns_403
+      test_file: tests/integration/test_fr04.py
+    - tc_id: TC-FR05-01
+      fr: FR-05
+      ac: AC-5.2
+      layer: integration
+      test_function: test_fr05_rate_limit_exceeded_returns_429
+      test_file: tests/integration/test_fr05.py
+    - tc_id: TC-FR06-01
+      fr: FR-06
+      ac: AC-6.2
+      layer: integration
+      test_function: test_fr06_session_commits_on_success_rolls_back_on_exception
+      test_file: tests/integration/test_fr06.py
+    - tc_id: TC-FR07-01
+      fr: FR-07
+      ac: AC-7.3
+      layer: integration
+      test_function: test_fr07_migration_round_trip_preserves_data
+      test_file: tests/integration/test_fr07.py
+    - tc_id: TC-FR08-01
+      fr: FR-08
+      ac: AC-8.1
+      layer: integration
+      test_function: test_fr08_graceful_drain_waits_for_inflight_tasks
+      test_file: tests/integration/test_fr08.py
+    - tc_id: TC-FR09-01
+      fr: FR-09
+      ac: AC-9.2
+      layer: integration
+      test_function: test_fr09_readyz_returns_503_when_db_down
+      test_file: tests/integration/test_fr09.py
+    - tc_id: TC-FR10-01
+      fr: FR-10
+      ac: AC-10.1
+      layer: integration
+      test_function: test_fr10_error_response_is_problem_json
+      test_file: tests/integration/test_fr10.py
     # An NFR whose verifier is a unit or static check belongs here with its
     # layer, and in TEST_SPEC.md's "Deferred to Downstream Phases" section.
     - tc_id: TC-N02-01
@@ -58,13 +112,22 @@ test_inventory:
       test_function: test_deployment_example
       test_file: tests/integration/test_nfr09.py
   coverage_summary:
-    total_test_cases: 4
+    total_test_cases: 13
     by_fr:
       FR-01: {tc_count: 2}
+      FR-02: {tc_count: 1}
+      FR-03: {tc_count: 1}
+      FR-04: {tc_count: 1}
+      FR-05: {tc_count: 1}
+      FR-06: {tc_count: 1}
+      FR-07: {tc_count: 1}
+      FR-08: {tc_count: 1}
+      FR-09: {tc_count: 1}
+      FR-10: {tc_count: 1}
       NFR-02: {tc_count: 1}
       NFR-09: {tc_count: 1}
     by_layer:
-      integration: {count: 2}
+      integration: {count: 11}
       unit: {count: 1}
       static: {count: 1}
 
@@ -79,6 +142,33 @@ fr_tests:
       - test_fr01_example_unit
     integration:
       - test_fr01_example_integration
+  FR-02:
+    integration:
+      - test_fr02_run_task_returns_202_with_run_id
+  FR-03:
+    integration:
+      - test_fr03_missing_api_key_returns_401
+  FR-04:
+    integration:
+      - test_fr04_insufficient_scope_returns_403
+  FR-05:
+    integration:
+      - test_fr05_rate_limit_exceeded_returns_429
+  FR-06:
+    integration:
+      - test_fr06_session_commits_on_success_rolls_back_on_exception
+  FR-07:
+    integration:
+      - test_fr07_migration_round_trip_preserves_data
+  FR-08:
+    integration:
+      - test_fr08_graceful_drain_waits_for_inflight_tasks
+  FR-09:
+    integration:
+      - test_fr09_readyz_returns_503_when_db_down
+  FR-10:
+    integration:
+      - test_fr10_error_response_is_problem_json
 
 cross_cutting:
   security:

@@ -1,15 +1,48 @@
-# Software Architecture Document (SAD) — {Project Name}
-
-<!-- harness:template-stub -->
-<!-- Remove the sentinel line above once you start filling this SAD.
-     While present, harness load-context emits a stub warning. -->
-
-> On-demand Lazy Load template.
+# Software Architecture Document (SAD) — taskq-api
 
 ## 1. Architecture Overview
-{High-level architecture description}
 
-### 1.1 System Verification Target
+`taskq-api` is an ASGI HTTP service (FastAPI, `uvicorn taskq_api.app:app`) that
+turns the Round-1 CLI task queue into a REST API with relational persistence.
+Requests enter through a single FastAPI app, pass a shared auth+scope+rate-limit
+dependency, are handled by thin API handlers that delegate to a `service/`
+business layer, which reads/writes through a `repository/` layer holding all
+`Session`/transaction boundaries over SQLAlchemy 2.x ORM models. Schema evolves
+via three Alembic revisions (v1→v2→v3). Task execution runs out-of-band via an
+`asyncio.TaskGroup` background executor spawning `asyncio.create_subprocess_exec`
+subprocesses (never `shell=True`). All non-2xx responses are RFC 7807
+`application/problem+json`. A `python -m taskq_api` entrypoint provides
+`migrate` / `seed` / `healthcheck` / `key create` management commands.
+
+Layering is a hard contract (SPEC.md NFR-06, `.importlinter`):
+
+```
+api  >  service  >  repository  >  models
+```
+
+Upper layers may import lower layers; lower layers MUST NOT import upper
+layers. `config` and `exceptions`/`redaction` are independent (importable by
+any layer, import nothing project-internal upward). Only `repository/` and
+`models/` may import `sqlalchemy` — this is enforced as a forbidden-import
+contract, not just a convention, because ORM leaking into `service`/`api` is
+the concrete anti-pattern this round is designed to catch.
+
+### 1.1 Technology Stack (SPEC.md §2)
+
+| Component | Technology | Rationale |
+|-----------|-----------|-----------|
+| HTTP framework | FastAPI (ASGI) | async-native, dependency-injection auth/scope/rate-limit, auto OpenAPI (NFR-05) |
+| Validation | pydantic v2 | request/response schema validation (FR-01) |
+| ORM | SQLAlchemy 2.x, declarative + explicit `Session` | isolates transaction boundaries in `repository/` (FR-06) |
+| Database | SQLite (dev/test), PostgreSQL (prod) — one ORM model set | portability without dialect-specific ORM code |
+| Migration | Alembic, 3 revisions each with `downgrade` | reversible schema evolution incl. data migration (FR-07) |
+| Async | `async def` endpoints + `asyncio.TaskGroup` | background task execution, graceful drain (FR-08) |
+| Auth | `X-API-Key` header, SHA-256 hash + `hmac.compare_digest` | no plaintext keys at rest, constant-time compare (FR-03) |
+| Rate limiting | per-token token bucket, DB-backed row lock | consistent across workers (FR-05) |
+| Error contract | RFC 7807 `application/problem+json` | uniform, detail-scrubbed error body (FR-10) |
+| Layering | `import-linter` | machine-checked `.importlinter` contract (NFR-06) |
+
+### 1.2 System Verification Target
 > **Every exit gate (2, 3 and 4)**: the harness executes `make verify-system`. A
 > non-zero exit fails the gate. The target name is fixed — the harness always calls
 > `make verify-system`.
@@ -32,7 +65,14 @@
 > Any module your test suite replaces with an `autouse` stand-in has to run for
 > real here.
 **Makefile target**: `verify-system`
-**Exercises**: {which high-risk modules / acceptance criteria this target executes}
+**Exercises** (SPEC.md NFR-12, §8 row 27): chains, in order, (1) `alembic upgrade head`
+against a real SQLite file (exercises `migrations/versions/v3_split_results.py`,
+FR-07), (2) the full test suite, (3) starting the real ASGI service and smoke-testing
+`GET /healthz` and `GET /readyz` (exercises `taskq_api.app`, `taskq_api.service.auth`
+via a live API-key round trip, and `taskq_api.repository.session`'s pool/connectivity
+check), (4) `alembic downgrade base` then `alembic upgrade head` again (round-trip
+verification of the same v3 data-migration high-risk module). Exit 0 required; stdout
+must print `verify-system: PASS`.
 
 ## 2. Module Design
 
@@ -110,29 +150,188 @@ Critically, **module-level calls alone are insufficient**. A module-level `_ = v
 ✅ src/infrastructure/{circuit,health,config,models}.py → shared domain layer
 ```
 
-### 2.2 {Module Name}
+### 2.2 Directory Structure
 
-| Attribute | Value |
-|-----------|-------|
-| Responsibility | {responsibility} |
-| External Interface | {API} |
-| Dependencies | {dependency modules} |
+SPEC.md does not enumerate a standalone directory-tree section; the tree below
+is derived from the layering contract (NFR-06), the high-risk module names
+SPEC.md §10 already names literally (`taskq_api.service.runner`,
+`taskq_api.service.auth`, `taskq_api.repository.session`,
+`migrations/versions/v3_split_results.py`), and the module responsibilities
+implied by each FR/NFR clause. 4 source directories (within the 3–6 target),
+each ≤6 files (well under the 15/dir cap and the 50-node CRG community cap),
+one hub per directory, entry points co-located with their hub.
 
-#### Logical Constraints
-- {constraint 1}
-- {constraint 2}
+```
+03-development/src/taskq_api/
+├── app.py               # ASGI app factory + lifespan (startup/graceful drain) — entry point
+├── __main__.py          # CLI entry: migrate | seed | healthcheck | key create
+├── config.py            # env var loading (independent — no project-internal imports)
+├── exceptions.py        # domain exception hierarchy (independent)
+├── redaction.py         # secret-pattern scrubbing for logs/errors (independent, NFR-04)
+├── api/                 # hub: dependencies.py (imported by every route + error_handlers)
+│   ├── routes_tasks.py
+│   ├── routes_admin.py
+│   ├── dependencies.py  # HUB — single auth+scope+rate-limit dependency (FR-04)
+│   ├── error_handlers.py
+│   └── schemas.py
+├── service/             # hub: auth.py (imported by rate_limiter + tasks + runner)
+│   ├── tasks.py
+│   ├── runner.py
+│   ├── auth.py          # HUB — key verification, scope hierarchy (FR-03/04)
+│   ├── rate_limiter.py
+│   └── metrics.py
+├── repository/          # hub: session.py (imported by every *_repo.py)
+│   ├── session.py       # HUB — Session/transaction boundary, pool config (FR-06)
+│   ├── tasks_repo.py
+│   ├── results_repo.py
+│   ├── keys_repo.py
+│   └── rate_repo.py
+└── models/              # hub: task.py (task_tags/tags associate through it)
+    ├── task.py           # HUB — tasks, tags, task_tags
+    ├── api_key.py
+    ├── task_result.py
+    └── rate_bucket.py
 
-## 3. Error Handling
-| Level | Handling Strategy |
-|-------|------------------|
-| Level 1 | Immediate return |
-| Level 2 | Retry 3 times |
-| Level 3 | Graceful degradation |
+migrations/versions/      # v1_initial.py, v2_tags.py, v3_split_results.py (FR-07)
+```
 
-## 4. Technology Choices
-| Technology | Rationale |
-|------------|----------|
-| {technology} | {reason} |
+No circular dependencies: `api → service → repository → models` is a strict
+DAG (import-linter-enforced); `config`/`exceptions`/`redaction` sit outside
+the DAG and are leaves (import nothing from the four layers), so nothing
+cycles back into them.
+
+### 2.3 Module-to-FR Traceability
+
+| Module | Responsibility | Depends on | FR(s) |
+|--------|----------------|-----------|-------|
+| `api/routes_tasks.py` | `/v1/tasks*` route handlers (thin, ≤40 lines/handler — NFR-11) | `service.tasks`, `service.runner`, `api.schemas` | FR-01, FR-02 |
+| `api/routes_admin.py` | `/healthz`, `/readyz`, `/v1/metrics` | `service.metrics`, `repository.session` | FR-09 |
+| `api/dependencies.py` (**hub**) | single FastAPI dependency doing auth + scope + rate-limit for every `/v1` route (FR-04's "single dependency" requirement) | `service.auth`, `service.rate_limiter` | FR-03, FR-04, FR-05 |
+| `api/error_handlers.py` | RFC 7807 problem+json exception handlers | `exceptions`, `redaction` | FR-10 |
+| `api/schemas.py` | pydantic request/response models | — | FR-01 |
+| `service/tasks.py` | task CRUD orchestration, name-uniqueness/validation | `repository.tasks_repo`, `service.auth` (hub) | FR-01 |
+| `service/runner.py` | `asyncio.TaskGroup` executor, `create_subprocess_exec`, timeout+kill, graceful drain | `repository.results_repo`, `service.auth` (hub), `redaction` | FR-02, FR-08 |
+| `service/auth.py` (**hub**) | key hash/verify (`hmac.compare_digest`), scope hierarchy check | `repository.keys_repo` | FR-03, FR-04 |
+| `service/rate_limiter.py` | token-bucket algorithm | `repository.rate_repo`, `service.auth` (hub) | FR-05 |
+| `service/metrics.py` | status counts, latency quantiles, rate-limit rejection counts | `repository.tasks_repo`, `service.auth` (hub) | FR-09 |
+| `repository/session.py` (**hub**) | per-request `Session`, commit/rollback context manager, pool (`pool_size`, `pool_pre_ping`) | SQLAlchemy only | FR-06 |
+| `repository/tasks_repo.py` | task CRUD queries, `selectinload`/`joinedload` (N+1 guard) | `repository.session` (hub), `models.task` | FR-01, FR-06 |
+| `repository/results_repo.py` | `task_results` read/write | `repository.session` (hub), `models.task_result` | FR-02, FR-07 |
+| `repository/keys_repo.py` | `api_keys` read/write, `revoked_at` check | `repository.session` (hub), `models.api_key` | FR-03 |
+| `repository/rate_repo.py` | row-level-locked token-bucket persistence | `repository.session` (hub), `models.rate_bucket` | FR-05 |
+| `models/task.py` (**hub**) | `tasks`, `tags`, `task_tags` ORM classes | SQLAlchemy only | FR-01, FR-07 |
+| `models/api_key.py` | `api_keys` ORM class | `models.task` (hub, for shared declarative base) | FR-03 |
+| `models/task_result.py` | `task_results` ORM class | `models.task` (hub) | FR-02, FR-07 |
+| `models/rate_bucket.py` | `rate_buckets` ORM class | `models.task` (hub) | FR-05 |
+| `migrations/versions/v1_initial.py` | create `tasks`, `api_keys` | Alembic only | FR-07 |
+| `migrations/versions/v2_tags.py` | add `tags`, `task_tags`, unique index | Alembic only | FR-07 |
+| `migrations/versions/v3_split_results.py` | split `tasks.result_json` → `task_results`, reversible data migration | Alembic only | FR-07 |
+| `app.py` | app factory, lifespan-managed graceful drain | `api.*`, `service.runner` | FR-08, FR-09 |
+| `__main__.py` | `migrate` / `seed` / `healthcheck` / `key create` CLI | `service.auth`, `repository.keys_repo` | FR-03 |
+
+Every FR-01..FR-10 maps to ≥1 module above; no module exceeds the 40-line
+handler cap (NFR-11) by design (business logic sits in `service/`, not
+`api/`).
+
+## 3. Interfaces & Data Flows
+
+### 3.1 Synchronous request flow (FR-01, FR-03, FR-04, FR-05, FR-10)
+
+```
+Client
+  │  HTTP + X-API-Key
+  ▼
+uvicorn (ASGI) ── app.py
+  ▼
+FastAPI routing ── api/routes_tasks.py | routes_admin.py
+  ▼
+api/dependencies.py  (single dependency: auth → scope → rate limit)
+  │         │                    │
+  │         ▼                    ▼
+  │   service/auth.py     service/rate_limiter.py
+  │   (hash+compare,      (token bucket via
+  │    repository/         repository/rate_repo.py,
+  │    keys_repo.py)        row-level lock)
+  │
+  ▼ (401/403/429 short-circuit here, before handler body runs — FR-04's
+     "not leaked via resource lookup" requirement: auth/scope resolves
+     before any resource query)
+route handler (≤40 LOC) ── service/tasks.py
+  ▼
+repository/tasks_repo.py ── repository/session.py (Session, tx boundary)
+  ▼
+SQLAlchemy ORM ── models/task.py
+  ▼
+SQLite / PostgreSQL
+  ▲
+  │ on exception at any layer
+api/error_handlers.py → RFC 7807 problem+json (redaction.py scrubs `detail`)
+```
+
+### 3.2 Async task-execution flow (FR-02, FR-08)
+
+```
+POST /v1/tasks/{id}/run  →  202 Accepted {run_id}
+  │
+  ▼
+service/runner.py: asyncio.TaskGroup.create_task(...)
+  │
+  ▼
+asyncio.create_subprocess_exec(*shlex.split(command))   # never shell=True
+  │
+  ├─ asyncio.wait_for(timeout=TASKQ_TASK_TIMEOUT)
+  │     └─ on timeout: process.kill() → await process.wait()  (no orphans)
+  │
+  ├─ on asyncio.CancelledError: re-raise (never swallowed — NFR-03)
+  │
+  ▼
+repository/results_repo.py → task_results row (exit_code, stdout_tail,
+  stderr_tail redacted by redaction.py, duration_ms, finished_at)
+  │
+  ▼
+GET /v1/tasks/{id}/runs → newest-first history
+```
+
+Service shutdown: `app.py` lifespan waits for in-flight `TaskGroup` members up
+to `TASKQ_DRAIN_TIMEOUT`; timed-out runs are marked `interrupted` (FR-08).
+
+### 3.3 Schema migration flow (FR-07, FR-09)
+
+```
+alembic upgrade head
+  → migrations/versions/v1_initial.py   (tasks, api_keys)
+  → migrations/versions/v2_tags.py      (tags, task_tags, unique index)
+  → migrations/versions/v3_split_results.py
+        (data migration: tasks.result_json → task_results, then drop column)
+  ↓
+GET /readyz  →  DB reachable AND `alembic current` == head → 200
+             →  otherwise 503 fail-closed with a body naming which check failed
+```
+
+`downgrade` at every revision must be a real inverse (v3's downgrade migrates
+`task_results` rows back into `tasks.result_json` before dropping the table),
+verified by round-trip sample-data comparison (SPEC.md §8 row 12).
+
+## 4. NFR Handling
+
+| NFR | Concern | Module(s) | Handling |
+|-----|---------|-----------|----------|
+| NFR-01 (performance) | p95 latency, N+1 | `repository/tasks_repo.py` | `selectinload`/`joinedload` explicit eager loading; SQLAlchemy `event` listener counts SQL statements per request in tests to assert the count is constant regardless of row count; `pytest-benchmark` asserts p95 < 30ms (`GET /v1/tasks/{id}`) / < 80ms (list, limit 50) at 10k rows |
+| NFR-02 (security) | authn/authz, injection, CORS | `service/auth.py`, `repository/*_repo.py`, `config.py` | keys SHA-256-hashed + `hmac.compare_digest`; all queries via ORM/parameterized statements (grep gate: 0 hits for string-built SQL); `TASKQ_CORS_ORIGINS` default-empty (deny-all); `bandit -r` gate at 0 HIGH/0 MEDIUM |
+| NFR-03 (error handling / async correctness) | tx integrity, cancellation | `repository/session.py`, `service/runner.py` | context-manager-guaranteed commit-on-success/rollback-on-exception; no bare `except:`; `asyncio.CancelledError` explicitly re-raised, never caught by a bare `except Exception` |
+| NFR-04 (sensitive-data masking) | secrets in logs/output | `redaction.py` | regex `(sk-[A-Za-z0-9_-]{8,}|token=\S+|Bearer\s+\S+|postgres(ql)?://[^\s]+)` replaces the whole matching line with `[REDACTED]` before any log/response write; applied in `service/runner.py` (stdout/stderr tails) and `api/error_handlers.py` (error `detail`) |
+| NFR-05 (documentation) | docstring coverage | all modules | every public function/class carries a docstring referencing its owning `[FR-XX]`/`[NFR-XX]`; FastAPI auto-generates `/openapi.json` `summary`/`description` per route, asserted by test |
+| NFR-06 (architecture constraints) | layering | project-root `.importlinter` | `api > service > repository > models` layers contract + forbidden-import rule (`sqlalchemy` only importable from `repository`/`models`); `lint-imports` must exit 0 |
+| NFR-07 (license compliance) | dependency licensing | `requirements.txt` / `requirements.lock` (deployment artifacts, not a code module) | pinned direct deps + fully locked transitive tree; `pip-licenses --with-system` scanned against an MIT/BSD-2/BSD-3/Apache-2.0/PSF allowlist; SBOM emitted to `08-config/SBOM.json` |
+| NFR-08 (mutation testing) | test strength | `service/`, `repository/` (scope-limited) | `mutmut run` scoped to these two layers per `harness_config.json`; score ≥ 70 |
+| NFR-09 (test assertion quality) | zero-skip | `03-development/tests/` | no `skip`/`xfail`/assertion-free stubs anywhere, including the FR-07 migration tests, which run against a real SQLite file (not in-memory/mocked) |
+| NFR-10 (integration coverage) | end-to-end paths | `03-development/tests/integration/` | driven via `httpx.AsyncClient(transport=ASGITransport(app))` (never calling handlers directly); ≥80% line coverage; covers full CRUD, every error code, migration round-trip, rate-limit trip/recovery, graceful drain |
+| NFR-11 (readability) | maintainability index / CC | all modules | file ≤400 lines, directory ≤15 files (both satisfied by §2.2's tree), function CC ≤10, handler bodies ≤40 lines (business logic pushed into `service/`) |
+| NFR-12 (execute verification target) | system-level proof | `Makefile` `verify-system` | see §1.2 — chains real migration, real test run, real service smoke test, real migration round-trip |
+
+**Cost**: no NFR specifies a cost/budget target; SPEC.md's only quantitative
+constraints are latency (NFR-01) and coverage/score thresholds — no cost
+dimension is in scope for this round.
 
 ---
 
@@ -148,26 +347,69 @@ Critically, **module-level calls alone are insufficient**. A module-level `_ = v
 ```yaml
 sab:
   version: "1.0"
-  created_at: "{YYYY-MM-DD}"
+  created_at: "2026-09-07"
   phase: 2  # MUST be int, NOT a string — parser raises on 'phase: "2"'
-  project: "{project_name}"
+  project: "taskq-api"
 
-  layers:  # EXAMPLE — replace with your project's layers
+  layers:
     - name: api
       modules:
-        - name: "app.api.webhooks"
-          implemented_in: "app.main"  # OPTIONAL — Use if consolidated into another file
-      allowed_dependencies: ["service"]
+        - name: "taskq_api.app"
+        - name: "taskq_api.__main__"
+        - name: "taskq_api.api.routes_tasks"
+        - name: "taskq_api.api.routes_admin"
+        - name: "taskq_api.api.dependencies"
+        - name: "taskq_api.api.error_handlers"
+        - name: "taskq_api.api.schemas"
+      allowed_dependencies: ["service", "shared"]
     - name: service
-      modules: ["app.service.handlers"]
+      modules:
+        - name: "taskq_api.service.tasks"
+        - name: "taskq_api.service.runner"
+        - name: "taskq_api.service.auth"
+        - name: "taskq_api.service.rate_limiter"
+        - name: "taskq_api.service.metrics"
+      allowed_dependencies: ["repository", "shared"]
+    - name: repository
+      modules:
+        - name: "taskq_api.repository.session"
+        - name: "taskq_api.repository.tasks_repo"
+        - name: "taskq_api.repository.results_repo"
+        - name: "taskq_api.repository.keys_repo"
+        - name: "taskq_api.repository.rate_repo"
+      allowed_dependencies: ["models", "shared"]
+    - name: models
+      modules:
+        - name: "taskq_api.models.task"
+        - name: "taskq_api.models.api_key"
+        - name: "taskq_api.models.task_result"
+        - name: "taskq_api.models.rate_bucket"
+      allowed_dependencies: ["shared"]
+    - name: shared  # config/exceptions/redaction — leaves, import nothing project-internal
+      modules:
+        - name: "taskq_api.config"
+        - name: "taskq_api.exceptions"
+        - name: "taskq_api.redaction"
       allowed_dependencies: []
 
   allowed_dependencies:
     - from: api
       to: service
+    - from: api
+      to: shared
+    - from: service
+      to: repository
+    - from: service
+      to: shared
+    - from: repository
+      to: models
+    - from: repository
+      to: shared
+    - from: models
+      to: shared
 
   quality_targets:
-    max_complexity: 15
+    max_complexity: 10
     min_coverage: 80
     max_coupling: 0.3
 
@@ -175,41 +417,106 @@ sab:
 
   nfr_traceability:
     NFR-01:
-      # type MUST be one of 14 legal values listed below:
-      # Enforceable (mapped to gate dim):
-      #   documentation, integration, layering, licensing, maintainability, mutation, performance, reliability, security, testability, verifiability
-      # Advisory (no scoring tool, auto-added to advisory_only):
-      #   deployability, scalability, usability
       type: performance
-      # dimension: OPTIONAL and PREFERRED — the gate dimension this NFR
-      #   is scored by, copied verbatim from SPEC.md's own `dimension:`
-      #   for this NFR. Outranks the type guess above. `none` = no
-      #   automated scorer. A name no gate scores is REFUSED (the error
-      #   lists the legal names), never silently dropped.
-      target: "p95 < 200ms"  # use ">=N" or "≥N" to raise the gate floor
-      module: app.processing.pipeline
+      dimension: performance  # SRS.md:349
+      target: "p95 < 30ms (GET /v1/tasks/{id}) / < 80ms (list, limit 50) at 10k rows"
+      module: taskq_api.repository.tasks_repo
+    NFR-02:
+      type: security
+      dimension: security  # SRS.md:380
+      target: "bandit -r: 0 HIGH / 0 MEDIUM findings"
+      module: taskq_api.service.auth
+    NFR-03:
+      type: reliability
+      dimension: error_handling  # SRS.md:422
+      target: "no bare except; asyncio.CancelledError always re-raised"
+      module: taskq_api.repository.session
+    NFR-04:
+      type: security
+      dimension: security  # SRS.md:464
+      target: "0 unredacted secret-pattern hits in logs/responses"
+      module: taskq_api.redaction
+    NFR-05:
+      type: documentation
+      dimension: documentation  # SRS.md:491
+      target: "100% public API docstring coverage citing FR/NFR ID"
+      module: taskq_api
+    NFR-06:
+      type: layering
+      dimension: architecture_constraints  # SRS.md:513
+      target: "lint-imports exit 0 (zero layering-contract violations)"
+      module: .importlinter
+    NFR-07:
+      type: licensing
+      dimension: license_compliance  # SRS.md:544
+      target: "0 non-allowlisted licenses (MIT/BSD-2/BSD-3/Apache-2.0/PSF only)"
+      module: requirements.txt
+    NFR-08:
+      type: mutation
+      dimension: mutation_testing  # SRS.md:577
+      target: ">=70"
+      module: taskq_api.service
+      scope_layers: [service, repository]  # SRS AC-N8.3 — mutmut scope-limited to these two layers
+    NFR-09:
+      type: testability
+      dimension: test_assertion_quality  # SRS.md:599
+      target: "0 skipped/xfail tests, including FR-07 migration tests against a real SQLite file"
+      module: 03-development/tests
+    NFR-10:
+      type: integration
+      dimension: integration_coverage  # SRS.md:642
+      target: ">=80"
+      module: 03-development/tests/integration
+    NFR-11:
+      type: maintainability
+      dimension: readability  # SRS.md:670
+      target: "file <= 400 lines; function CC <= 10; handler bodies <= 40 lines"
+      module: taskq_api
+    NFR-12:
+      type: verifiability
+      dimension: execute_verification_target  # SRS.md:698
+      target: "make verify-system exits 0 and prints verify-system: PASS"
+      module: Makefile
 
   advisory_only: []  # AUTO-FILLED by parser — omit or leave []
 
   gate_score_overrides: {}  # AUTO-DERIVED by parser — omit or leave {}
 
-  fr_module_traceability:  # EXAMPLE — one entry per FR
-    # If an FR owns MULTIPLE modules, use a YAML list instead of a single
-    # string, e.g. FR-02: ["app.a", "app.b"] — both forms are supported.
-    FR-01: "app.api.webhooks"
+  fr_module_traceability:
+    FR-01: ["taskq_api.api.routes_tasks", "taskq_api.api.schemas", "taskq_api.service.tasks", "taskq_api.repository.tasks_repo", "taskq_api.models.task"]
+    FR-02: ["taskq_api.api.routes_tasks", "taskq_api.service.runner", "taskq_api.repository.results_repo", "taskq_api.models.task_result"]
+    FR-03: ["taskq_api.api.dependencies", "taskq_api.service.auth", "taskq_api.repository.keys_repo", "taskq_api.models.api_key", "taskq_api.__main__"]
+    FR-04: ["taskq_api.api.dependencies", "taskq_api.service.auth"]
+    FR-05: ["taskq_api.api.dependencies", "taskq_api.service.rate_limiter", "taskq_api.repository.rate_repo", "taskq_api.models.rate_bucket"]
+    FR-06: ["taskq_api.repository.session", "taskq_api.repository.tasks_repo"]
+    FR-07: ["taskq_api.repository.results_repo", "taskq_api.models.task", "taskq_api.models.task_result", "migrations.versions.v1_initial", "migrations.versions.v2_tags", "migrations.versions.v3_split_results"]
+    FR-08: ["taskq_api.service.runner", "taskq_api.app"]
+    FR-09: ["taskq_api.api.routes_admin", "taskq_api.service.metrics", "taskq_api.repository.session", "taskq_api.app"]
+    FR-10: ["taskq_api.api.error_handlers"]
 
   architecture_constraints:
     - "no_circular_dependencies"
 
   high_risk_modules:
-    - "app.api.webhooks"
+    - "taskq_api.service.runner"
+    - "taskq_api.service.auth"
+    - "taskq_api.repository.session"
+    - "migrations.versions.v3_split_results"
 
   required_artifacts:  # repo-relative paths this project MUST ship
     # Checked against the delivered tree at every gate. A path that
     # is absent, or that ships somewhere other than where it is
     # declared, blocks and the message says which. Omit or leave []
     # if the spec names no mandatory files.
+    - ".importlinter"
+    - "requirements.txt"
+    - "requirements.lock"
+    - "requirements-dev.txt"
+    - "alembic.ini"
+    - "migrations/versions/"
     - ".env.example"
+    - ".methodology/harness_config.json"
+    - "Makefile"
 ```
 <!-- SAB:END -->
 
@@ -236,21 +543,71 @@ Generate: `python3 scripts/generate_sab.py --project . [--overwrite]`
 ```yaml
 security_design:
   version: "1.0"
-  applicability: full   # full | none — none REQUIRES justification and skips the rest
-  justification: ""     # required (>=20 chars) when applicability: none
-  trust_boundaries:     # EXAMPLE — replace with your project's real boundaries
+  applicability: full
+  justification: ""
+  trust_boundaries:
     - id: TB-01
-      name: "external HTTP input"
-      description: "requests crossing from unauthenticated clients into the API layer"
-  threats:              # STRIDE-lite — every boundary needs >=1 threat
+      name: "unauthenticated HTTP ingress"
+      description: "requests crossing from unauthenticated internet clients into api/dependencies.py before any identity is established"
+    - id: TB-02
+      name: "cross-scope privilege boundary"
+      description: "an authenticated caller holding a lower scope (read/write) reaching a handler that requires a higher scope (write/admin)"
+    - id: TB-03
+      name: "task command to OS subprocess"
+      description: "user-supplied task `command` string crossing from the API/DB into a real OS subprocess via service/runner.py"
+    - id: TB-04
+      name: "internal detail to external observer"
+      description: "internal state (DB connection strings, stack traces, subprocess stdout/stderr) crossing from the process into an HTTP response body or a log sink a caller/operator can read"
+    - id: TB-05
+      name: "concurrent request to shared rate-limit state"
+      description: "multiple concurrent requests for the same API key crossing into the shared `rate_buckets` row in the database"
+  threats:
     - id: T-01
       boundary: TB-01
-      category: tampering   # spoofing|tampering|repudiation|information_disclosure|denial_of_service|elevation_of_privilege
-      description: "malformed payload mutates task state without validation"
-      mitigation: "schema validation + reject on unknown fields"
-      owner_module: "app.api.webhooks"   # MUST be a module declared in the SAB block (§5)
-      nfr: NFR-02                        # optional — MUST exist in SRS when present
-      verified_by: "test_sec_t01_malformed_payload_rejected"   # single test name only — NOT "test_a, test_b"; split multi-test threats into separate T-NN entries
+      category: spoofing
+      description: "a caller with no key, an invalid key, or a revoked key attempts to be treated as an authenticated identity"
+      mitigation: "X-API-Key required on every /v1/* route; key compared as SHA-256 hash via hmac.compare_digest (constant-time); revoked_at IS NOT NULL keys always rejected; missing/invalid -> 401"
+      owner_module: "taskq_api.service.auth"
+      nfr: NFR-02
+      verified_by: "test_sec_t01_invalid_or_revoked_api_key_rejected"
+    - id: T-02
+      boundary: TB-02
+      category: elevation_of_privilege
+      description: "a write-scoped key calls an admin-only route (DELETE /v1/tasks/{id}, GET /v1/metrics) to act above its granted scope"
+      mitigation: "scope check runs inside the single shared api/dependencies.py dependency, before the handler or any resource lookup executes; insufficient scope -> 403 with a body that does not reveal whether the target resource exists"
+      owner_module: "taskq_api.api.dependencies"
+      nfr: NFR-02
+      verified_by: "test_sec_t02_insufficient_scope_rejected_without_leaking_existence"
+    - id: T-03
+      boundary: TB-03
+      category: tampering
+      description: "a task `command` value containing shell metacharacters (e.g. `; rm -rf`, backticks, `$()`) attempts to escape the intended single-executable invocation"
+      mitigation: "execution uses asyncio.create_subprocess_exec(*shlex.split(command)) exclusively; shell=True is project-wide forbidden and grep-gated to 0 hits"
+      owner_module: "taskq_api.service.runner"
+      nfr: NFR-02
+      verified_by: "test_sec_t03_shell_metacharacters_not_interpreted"
+    - id: T-04
+      boundary: TB-04
+      category: information_disclosure
+      description: "a 500 error body, a task's stdout/stderr tail, or a log line leaks a DB connection string, API token, or stack trace to a caller or log reader"
+      mitigation: "redaction.py replaces any line matching the secret-pattern regex with [REDACTED] before it is logged or written into a response; RFC 7807 detail is built from a fixed whitelist, never from raw exception text"
+      owner_module: "taskq_api.redaction"
+      nfr: NFR-04
+      verified_by: "test_sec_t04_secrets_redacted_from_response_and_logs"
+    - id: T-05
+      boundary: TB-05
+      category: denial_of_service
+      description: "two concurrent requests for the same key both read the token bucket before either writes, each believing capacity remains, and jointly exceed the intended burst limit"
+      mitigation: "token-bucket read-modify-write happens inside one DB transaction holding a row-level lock on the key's rate_buckets row, serializing concurrent updates"
+      owner_module: "taskq_api.repository.rate_repo"
+      verified_by: "test_sec_t05_concurrent_requests_do_not_exceed_burst"
+    - id: T-06
+      boundary: TB-02
+      category: repudiation
+      description: "an authenticated caller who triggered a destructive action (task run, task delete) later denies having done so, with no way to trace the action back to a specific request"
+      mitigation: "every response carries a correlation_id in both the X-Correlation-Id response header and the server log line for that request, linking any recorded action back to one traceable request"
+      owner_module: "taskq_api.api.error_handlers"
+      verified_by: "test_sec_t06_correlation_id_present_and_logged"
 ```
 <!-- SEC:END -->
 
